@@ -59,11 +59,12 @@ class SoftMoELayer(nn.Module):
 
 class PackerMoEFusion(nn.Module):
     """
-    Channel-Centric Fusion Architecture:
+    Channel-Centric Fusion Architecture with RevIN:
     1. Experts output (B, C, D) -> Time is embedded into D.
     2. TokenPacker uses C queries to aggregate cross-model channel features.
     3. Soft MoE performs differentiable expert fusion per channel token.
-    4. Channel-wise prediction head for final output.
+    4. Prediction head outputs values in normalized space.
+    5. RevIN restores scale based on pv_history statistics.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
                  num_queries=None, d_fusion=256, num_experts=4, device='cpu'):
@@ -99,12 +100,11 @@ class PackerMoEFusion(nn.Module):
         self.norm2 = nn.LayerNorm(d_fusion)
         
         # --- Stage 3: Prediction Head ---
-        # Instead of flattening, we use a channel-wise linear head
         self.output_head = nn.Linear(d_fusion, pred_len)
         
         self.to(device)
 
-    def forward(self, x):
+    def forward(self, x, pv_history):
         B = x.shape[0]
         
         # 1. Extract embeddings (B, C, D_i) and project to (B, C, d_fusion)
@@ -127,11 +127,19 @@ class PackerMoEFusion(nn.Module):
         fused_tokens = self.soft_moe(packed_tokens)
         fused_tokens = self.norm2(packed_tokens + fused_tokens)
         
-        # 4. Channel-wise prediction: (B, num_queries, pred_len)
-        out = self.output_head(fused_tokens)
+        # 4. Channel-wise prediction in normalized space: (B, num_queries, pred_len)
+        out = self.output_head(fused_tokens) # (B, C, P)
         
-        # If queries match features, result is (B, n_features, pred_len)
-        # Transpose to (B, pred_len, n_features) for standard output
+        # --- RevIN: Scale Restoration using pv_history ---
+        # pv_history shape: (B, L_pv, C)
+        means = pv_history.mean(dim=1, keepdim=True) # (B, 1, C)
+        stdev = torch.sqrt(pv_history.var(dim=1, keepdim=True, unbiased=False) + 1e-5) # (B, 1, C)
+        
+        # Apply denormalization to 'out' (B, C, P)
+        # Match dimensions by transposing statistics to (B, C, 1)
+        out = out * stdev.transpose(1, 2) + means.transpose(1, 2)
+        
+        # Final output formatting (B, P, C)
         if self.num_queries == self.n_features:
             return out.transpose(1, 2)
         else:

@@ -73,18 +73,21 @@ def run_demo():
     # Colleague's model is initialized with their specific needs
     expert_model = ExpertModelDemo(target_cols=['OT', 'HUFL'])
     
-    # 4. Single Batch Run
-    batch = next(iter(dataloader))
-    
-    # Simulate Fusion Model calling the expert model
-    print("Batch Keys:", batch.keys())
-    print("x_raw shape:", batch['x_raw'].shape)
+    # 4. Loop Through Batches
+    print(f"Total batches: {len(dataloader)}")
     
     with torch.no_grad():
-        hidden_output = expert_model.forward_hidden(batch)
-        print("Expert Hidden Output Shape:", hidden_output.shape)
+        for i, batch in enumerate(dataloader):
+            # Simulate Fusion Model calling the expert model
+            hidden_output = expert_model.forward_hidden(batch)
+            
+            if i % 5 == 0: # Print every 5 batches to avoid clutter
+                print(f"Batch {i}:")
+                print(f"  Batch Keys: {list(batch.keys())}")
+                print(f"  x_raw shape: {batch['x_raw'].shape}")
+                print(f"  Expert Hidden Output Shape: {hidden_output.shape}")
         
-    print("\nDemo successful! Colleagues should follow this pattern.")
+    print("\nDemo successful! All batches processed.")
 
 if __name__ == "__main__":
     run_demo()

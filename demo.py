@@ -50,7 +50,14 @@ def run_demo():
     
     # 2. Initialize Row-based Unified Dataset
     dataset = UnifiedDataset(df)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=4, 
+        shuffle=False, 
+        collate_fn=collate_fn,
+        num_workers=2, # Set to > 0 for multi-process loading
+        pin_memory=True # Faster transfer to GPU if using CUDA
+    )
     
     # 3. Initialize Expert Model
     # Example expert focusing on history data

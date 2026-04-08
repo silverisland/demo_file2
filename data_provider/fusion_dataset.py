@@ -2,71 +2,52 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from sklearn.preprocessing import StandardScaler
 
 class UnifiedDataset(Dataset):
     """
-    A unified dataset for fusion models that provides raw data and column metadata.
-    This allows expert models to perform their own internal preprocessing (e.g., column selection, scaling).
+    Row-based dataset for fusion models. 
+    Each item is a single row from the dataframe, excluding timestamps.
+    Metadata (column names) is preserved for expert models to select their own features.
     """
-    def __init__(self, df, seq_len=96, pred_len=24, target_col='OT', time_features=True):
+    def __init__(self, df, timestamp_cols=['date', 'time', 'timestamp', 'timestamp_win']):
         self.df_raw = df.copy()
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.target_col = target_col
-        self.time_features = time_features
         
-        # Get column names for the expert models to reference
-        self.column_names = list(self.df_raw.columns)
+        # 1. Identify and separate timestamp columns
+        self.timestamp_cols = [col for col in timestamp_cols if col in self.df_raw.columns]
+        self.feature_cols = [col for col in self.df_raw.columns if col not in self.timestamp_cols]
         
-        # Pre-process time features if requested
-        if 'date' in self.df_raw.columns:
-            self.df_raw['date'] = pd.to_datetime(self.df_raw['date'])
-            if self.time_features:
-                self.df_raw['month'] = self.df_raw.date.dt.month
-                self.df_raw['day'] = self.df_raw.date.dt.day
-                self.df_raw['weekday'] = self.df_raw.date.dt.weekday
-                self.df_raw['hour'] = self.df_raw.date.dt.hour
-                self.time_cols = ['month', 'day', 'weekday', 'hour']
-            else:
-                self.time_cols = []
-        else:
-            self.time_cols = []
-
-        # Values as float32 tensor
-        # We don't scale here because expert models might need raw values or their own scalers
-        self.data_values = self.df_raw.drop(columns=['date'] if 'date' in self.df_raw.columns else []).values.astype(np.float32)
+        # 2. Store clean column names for expert models to reference
+        self.column_names = self.feature_cols
         
     def __len__(self):
-        return len(self.data_values) - self.seq_len - self.pred_len + 1
+        return len(self.df_raw)
 
     def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end
-        r_end = r_begin + self.pred_len
-
-        seq_x = self.data_values[s_begin:s_end]
-        seq_y = self.data_values[r_begin:r_end]
-
-        # Return as a dictionary so it can be easily passed to models
-        return {
-            'x_raw': seq_x,
-            'y_raw': seq_y,
-            'column_names': self.column_names,
-            'index': index
-        }
+        # Returns a single row as a dictionary
+        row = self.df_raw.iloc[index]
+        sample = {col: row[col] for col in self.feature_cols}
+        sample['index'] = index
+        return sample
 
 def collate_fn(batch):
     """
-    Custom collate function to handle the dictionary output of UnifiedDataset.
+    Collates single rows into a batch.
+    Returns a dictionary of tensors where keys are column names.
     """
-    x_raw = torch.from_numpy(np.stack([b['x_raw'] for b in batch])).float()
-    y_raw = torch.from_numpy(np.stack([b['y_raw'] for b in batch])).float()
-    column_names = batch[0]['column_names']
+    feature_keys = [k for k in batch[0].keys() if k != 'index']
+    collated = {}
     
-    return {
-        'x_raw': x_raw,
-        'y_raw': y_raw,
-        'column_names': column_names
-    }
+    for key in feature_keys:
+        data_list = [b[key] for b in batch]
+        # Check if it's a list of numpy arrays or scalars
+        if isinstance(data_list[0], np.ndarray):
+            # Batch shape: (Batch, SeqLen)
+            collated[key] = torch.from_numpy(np.stack(data_list)).float()
+        else:
+            # Batch shape: (Batch,)
+            collated[key] = torch.tensor(data_list).float()
+            
+    collated['index'] = torch.tensor([b['index'] for b in batch])
+    collated['column_names'] = feature_keys
+    
+    return collated

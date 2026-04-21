@@ -83,59 +83,8 @@ class FusionModel(nn.Module):
         self._init_queries(query_init_type)
 
         self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
-    ...
-    def _init_queries(self, init_type):
-        """
-        Experimental initialization strategies for queries.
-        """
-        import math
-        q = self.queries.data
-        d_fusion = q.size(-1)
-
-        if init_type == 'normal':
-            nn.init.normal_(q, std=0.02)
-
-        elif init_type == 'orthogonal':
-            # Ensures queries are linearly independent initially
-            # Use a dummy 2D matrix for orthogonal init, then reshape
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.orthogonal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-
-        elif init_type == 'fourier':
-            # Periodic prior: sinusoidal initialization (like positional encoding)
-            for i in range(self.num_queries):
-                for j in range(d_fusion // 2):
-                    val = i / math.pow(10000, 2 * j / d_fusion)
-                    q[0, i, 2 * j] = math.sin(val)
-                    q[0, i, 2 * j + 1] = math.cos(val)
-            q.mul_(0.02) # Scale down to keep gradients stable
-
-        elif init_type == 'kaiming':
-            # He initialization, often used for layers with ReLU/GELU
-            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
-            
-        elif init_type == 'xavier':
-            # Glorot initialization, balanced for forward and backward pass
-            # Xavier requires 2D, so we treat it similarly to orthogonal
-            flat_q = torch.empty(self.num_queries, d_fusion)
-            nn.init.xavier_normal_(flat_q)
-            q.copy_(flat_q.unsqueeze(0))
-            
-        elif init_type == 'uniform':
-            limit = math.sqrt(3.0 / d_fusion)
-            nn.init.uniform_(q, -limit, limit)
-
-        elif init_type == 'constant':
-            nn.init.constant_(q, 1.0)
-            # Add tiny noise to break symmetry
-            q.add_(torch.randn_like(q) * 0.001)
-
-        else:
-            raise ValueError(f"Unknown query_init_type: {init_type}")
-
-    def forward(self, batch):
-
+        self.norm1 = nn.LayerNorm(d_fusion)
+        
         # Individual projectors to align base models (B, C, D_i) -> (B, C, d_fusion)
         self.projectors = nn.ModuleDict()
         for name, model in self.models_dict.items():
@@ -164,6 +113,49 @@ class FusionModel(nn.Module):
         self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
         
         self.to(device)
+
+    def _init_queries(self, init_type):
+        """
+        Experimental initialization strategies for queries.
+        """
+        import math
+        q = self.queries.data
+        d_fusion = q.size(-1)
+
+        if init_type == 'normal':
+            nn.init.normal_(q, std=0.02)
+
+        elif init_type == 'orthogonal':
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.orthogonal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+
+        elif init_type == 'fourier':
+            for i in range(self.num_queries):
+                for j in range(d_fusion // 2):
+                    val = i / math.pow(10000, 2 * j / d_fusion)
+                    q[0, i, 2 * j] = math.sin(val)
+                    q[0, i, 2 * j + 1] = math.cos(val)
+            q.mul_(0.02)
+
+        elif init_type == 'kaiming':
+            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
+            
+        elif init_type == 'xavier':
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.xavier_normal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+            
+        elif init_type == 'uniform':
+            limit = math.sqrt(3.0 / d_fusion)
+            nn.init.uniform_(q, -limit, limit)
+
+        elif init_type == 'constant':
+            nn.init.constant_(q, 1.0)
+            q.add_(torch.randn_like(q) * 0.001)
+
+        else:
+            raise ValueError(f"Unknown query_init_type: {init_type}")
 
     def forward(self, batch):
         # 1. Extract embeddings using the RAW batch

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.revin import RevIN
 
 class SoftMoELayer(nn.Module):
     """
@@ -60,32 +59,83 @@ class SoftMoELayer(nn.Module):
 
 class FusionModel(nn.Module):
     """
-    Channel-Centric Fusion Architecture with RevIN:
+    Channel-Centric Fusion Architecture:
     1. Experts output (B, C, D) -> Time is embedded into D.
     2. TokenPacker uses C queries to aggregate cross-model channel features.
     3. Soft MoE performs differentiable expert fusion per channel token.
-    4. Prediction head outputs values in normalized space.
-    5. RevIN restores scale based on pv_history statistics.
+    4. Prediction head outputs final values in target space.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
-                 num_queries=None, d_fusion=256, num_experts=4, device='cpu'):
+                 num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
+                 query_init_type='orthogonal'):
         super().__init__()
         self.models_dict = nn.ModuleDict(models_dict)
         self.device = device
         self.pred_len = pred_len
         self.n_features = n_features
-        
-        # RevIN module for distribution shift handling
-        self.revin = RevIN(n_features, affine=True, subtract_last=False)
-        
+        self.query_init_type = query_init_type
+
         # Use n_features as default num_queries for channel-specific fusion
         self.num_queries = num_queries if num_queries is not None else n_features
-        
+
         # --- Stage 1: TokenPacker (Injection) ---
-        self.queries = nn.Parameter(torch.randn(1, self.num_queries, d_fusion) * 0.02)
+        self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
+        self._init_queries(query_init_type)
+
         self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_fusion)
-        
+    ...
+    def _init_queries(self, init_type):
+        """
+        Experimental initialization strategies for queries.
+        """
+        import math
+        q = self.queries.data
+        d_fusion = q.size(-1)
+
+        if init_type == 'normal':
+            nn.init.normal_(q, std=0.02)
+
+        elif init_type == 'orthogonal':
+            # Ensures queries are linearly independent initially
+            # Use a dummy 2D matrix for orthogonal init, then reshape
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.orthogonal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+
+        elif init_type == 'fourier':
+            # Periodic prior: sinusoidal initialization (like positional encoding)
+            for i in range(self.num_queries):
+                for j in range(d_fusion // 2):
+                    val = i / math.pow(10000, 2 * j / d_fusion)
+                    q[0, i, 2 * j] = math.sin(val)
+                    q[0, i, 2 * j + 1] = math.cos(val)
+            q.mul_(0.02) # Scale down to keep gradients stable
+
+        elif init_type == 'kaiming':
+            # He initialization, often used for layers with ReLU/GELU
+            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
+            
+        elif init_type == 'xavier':
+            # Glorot initialization, balanced for forward and backward pass
+            # Xavier requires 2D, so we treat it similarly to orthogonal
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.xavier_normal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+            
+        elif init_type == 'uniform':
+            limit = math.sqrt(3.0 / d_fusion)
+            nn.init.uniform_(q, -limit, limit)
+
+        elif init_type == 'constant':
+            nn.init.constant_(q, 1.0)
+            # Add tiny noise to break symmetry
+            q.add_(torch.randn_like(q) * 0.001)
+
+        else:
+            raise ValueError(f"Unknown query_init_type: {init_type}")
+
+    def forward(self, batch):
+
         # Individual projectors to align base models (B, C, D_i) -> (B, C, d_fusion)
         self.projectors = nn.ModuleDict()
         for name, model in self.models_dict.items():
@@ -108,15 +158,18 @@ class FusionModel(nn.Module):
         
         # --- Stage 3: Prediction Head ---
         self.output_head = nn.Linear(d_fusion, pred_len)
+        self.dropout = nn.Dropout(0.1) # Prevent overfitting in latent space
+
+        # Aggregation layer: Map num_queries back to actual n_features
+        self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
         
         self.to(device)
 
     def forward(self, batch):
-        # 1. Extract embeddings using the RAW batch (un-normalized)
+        # 1. Extract embeddings using the RAW batch
         all_tokens = []
         with torch.no_grad():
             for name, model in self.models_dict.items():
-                # Expert receives original raw batch as requested
                 h = model.forward_hidden(batch) 
                 proj_h = self.projectors[name](h)
                 all_tokens.append(proj_h)
@@ -135,19 +188,12 @@ class FusionModel(nn.Module):
         fused_tokens = self.norm2(packed_tokens + fused_tokens)
         
         # 4. Channel-wise prediction in latent space: (B, num_queries, pred_len)
-        out = self.output_head(fused_tokens) # (B, C, P)
+        # Apply dropout to regularize latent features
+        out = self.output_head(self.dropout(fused_tokens)) # (B, num_queries, pred_len)
         
-        # 5. RevIN Denormalization using observe_power statistics
-        # Capture statistics from historical data (stats are stored internally)
-        _ = self.revin(batch['observe_power'], mode='norm')
+        # 5. Information Aggregation: Map queries to actual feature count
+        # (B, num_queries, pred_len) -> (B, n_features, pred_len)
+        output = self.aggregate(out)
         
-        # RevIN expects (B, L, C) or similar, so we transpose (B, C, P) -> (B, P, C)
-        out = out.transpose(1, 2) # (B, P, C)
-        out = self.revin(out, mode='denorm')
-        
-        # Final output formatting (B, P, C)
-        if self.num_queries == self.n_features:
-            return out
-        else:
-            # Fallback for arbitrary query counts
-            return out.view(B, self.pred_len, self.n_features)
+        # 6. Final output formatting: (B, n_features, pred_len) -> (B, pred_len, n_features)
+        return output.transpose(1, 2)

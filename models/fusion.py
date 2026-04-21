@@ -76,7 +76,7 @@ class FusionModel(nn.Module):
         self.n_features = n_features
         
         # RevIN module for distribution shift handling
-        self.revin = RevIN(n_features, affine=True)
+        self.revin = RevIN(n_features, affine=True, subtract_last=False)
         
         # Use n_features as default num_queries for channel-specific fusion
         self.num_queries = num_queries if num_queries is not None else n_features
@@ -138,9 +138,12 @@ class FusionModel(nn.Module):
         out = self.output_head(fused_tokens) # (B, C, P)
         
         # 5. RevIN Denormalization using observe_power statistics
+        # Capture statistics from historical data (stats are stored internally)
+        _ = self.revin(batch['observe_power'], mode='norm')
+        
         # RevIN expects (B, L, C) or similar, so we transpose (B, C, P) -> (B, P, C)
         out = out.transpose(1, 2) # (B, P, C)
-        out = self.revin(out, mode='denorm', external_stats=batch['observe_power'])
+        out = self.revin(out, mode='denorm')
         
         # Final output formatting (B, P, C)
         if self.num_queries == self.n_features:

@@ -1,5 +1,7 @@
 from torch.utils.data import DataLoader
-from data_provider.data_loader import TimeSeriesDataset, generate_dummy_data
+from data_provider.data_loader import generate_dummy_data
+from data_provider.fusion_dataset import UnifiedDataset, collate_fn
+import pandas as pd
 
 def data_provider(args, flag):
     if flag == 'test':
@@ -33,11 +35,19 @@ def data_provider(args, flag):
     else:
         x, y = x_data[n_train + n_val :], y_data[n_train + n_val :]
         
-    data_set = TimeSeriesDataset(x, y)
+    # Wrap into DataFrame for UnifiedDataset
+    df = pd.DataFrame({
+        'x': list(x),
+        'observe_power': list(x), # Historical target for RevIN
+        'observe_power_future': list(y),
+    })
+    
+    data_set = UnifiedDataset(df)
     data_loader = DataLoader(
         data_set,
         batch_size=batch_size,
         shuffle=shuffle_flag,
-        drop_last=drop_last
+        drop_last=drop_last,
+        collate_fn=collate_fn
     )
     return data_set, data_loader

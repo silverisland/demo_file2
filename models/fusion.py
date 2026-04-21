@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from layers.revin import RevIN
 
 class SoftMoELayer(nn.Module):
     """
@@ -57,7 +58,7 @@ class SoftMoELayer(nn.Module):
         out = torch.matmul(combine_weights, slots_output) # (B, N, D)
         return out
 
-class PackerMoEFusion(nn.Module):
+class FusionModel(nn.Module):
     """
     Channel-Centric Fusion Architecture with RevIN:
     1. Experts output (B, C, D) -> Time is embedded into D.
@@ -74,6 +75,9 @@ class PackerMoEFusion(nn.Module):
         self.pred_len = pred_len
         self.n_features = n_features
         
+        # RevIN module for distribution shift handling
+        self.revin = RevIN(n_features, affine=True)
+        
         # Use n_features as default num_queries for channel-specific fusion
         self.num_queries = num_queries if num_queries is not None else n_features
         
@@ -89,10 +93,13 @@ class PackerMoEFusion(nn.Module):
                 param.requires_grad = False
             model.eval()
             
-            # Infer hidden dim from dummy pass
-            dummy_x = torch.zeros(1, seq_len, n_features).to(device)
+            # Infer hidden dim from dummy pass with a dictionary input
+            dummy_batch = {
+                'x': torch.zeros(1, seq_len, n_features).to(device),
+                'observe_power': torch.zeros(1, seq_len, n_features).to(device)
+            }
             with torch.no_grad():
-                h = model.forward_hidden(dummy_x) # Expected (1, C, D_i)
+                h = model.forward_hidden(dummy_batch) # Base models now handle dicts
                 self.projectors[name] = nn.Linear(h.shape[-1], d_fusion)
         
         # --- Stage 2: Soft MoE (Fusing) ---
@@ -104,19 +111,19 @@ class PackerMoEFusion(nn.Module):
         
         self.to(device)
 
-    def forward(self, x, pv_history):
-        B = x.shape[0]
-        
-        # 1. Extract embeddings (B, C, D_i) and project to (B, C, d_fusion)
+    def forward(self, batch):
+        # 1. Extract embeddings using the RAW batch (un-normalized)
         all_tokens = []
         with torch.no_grad():
             for name, model in self.models_dict.items():
-                h = model.forward_hidden(x) 
+                # Expert receives original raw batch as requested
+                h = model.forward_hidden(batch) 
                 proj_h = self.projectors[name](h)
                 all_tokens.append(proj_h)
         
         # Concatenate tokens from all experts: (B, Num_Models * C, d_fusion)
         kv = torch.cat(all_tokens, dim=1)
+        B = kv.shape[0]
         
         # 2. TokenPacker: Aggregate info from all models into channel queries
         q = self.queries.expand(B, -1, -1)
@@ -127,21 +134,17 @@ class PackerMoEFusion(nn.Module):
         fused_tokens = self.soft_moe(packed_tokens)
         fused_tokens = self.norm2(packed_tokens + fused_tokens)
         
-        # 4. Channel-wise prediction in normalized space: (B, num_queries, pred_len)
+        # 4. Channel-wise prediction in latent space: (B, num_queries, pred_len)
         out = self.output_head(fused_tokens) # (B, C, P)
         
-        # --- RevIN: Scale Restoration using pv_history ---
-        # pv_history shape: (B, L_pv, C)
-        means = pv_history.mean(dim=1, keepdim=True) # (B, 1, C)
-        stdev = torch.sqrt(pv_history.var(dim=1, keepdim=True, unbiased=False) + 1e-5) # (B, 1, C)
-        
-        # Apply denormalization to 'out' (B, C, P)
-        # Match dimensions by transposing statistics to (B, C, 1)
-        out = out * stdev.transpose(1, 2) + means.transpose(1, 2)
+        # 5. RevIN Denormalization using observe_power statistics
+        # RevIN expects (B, L, C) or similar, so we transpose (B, C, P) -> (B, P, C)
+        out = out.transpose(1, 2) # (B, P, C)
+        out = self.revin(out, mode='denorm', external_stats=batch['observe_power'])
         
         # Final output formatting (B, P, C)
         if self.num_queries == self.n_features:
-            return out.transpose(1, 2)
+            return out
         else:
             # Fallback for arbitrary query counts
-            return out.view(B, -1, self.n_features)[:, :self.pred_len, :]
+            return out.view(B, self.pred_len, self.n_features)

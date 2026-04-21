@@ -40,7 +40,7 @@ class Exp_Main(Exp_Basic):
                     print(f"Warning: {path} not found for FusionModel. Using randomly initialized weights.")
                 base_models[name] = m
             
-            model = FusionModel(base_models, self.args.seq_len, self.args.pred_len, device=self.device).float()
+            model = FusionModel(base_models, self.args.seq_len, self.args.pred_len, self.args.enc_in, device=self.device).float()
         else:
             model = model_dict[self.args.model](self.args.seq_len, self.args.pred_len).float()
 
@@ -54,8 +54,8 @@ class Exp_Main(Exp_Basic):
 
     def _select_optimizer(self):
         if self.args.model == 'FusionModel':
-            # Only optimize fusion_head parameters
-            model_optim = optim.Adam(self.model.fusion_head.parameters(), lr=self.args.learning_rate)
+            # Optimize all trainable parameters (fusion layers)
+            model_optim = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.args.learning_rate)
         else:
             model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
@@ -68,13 +68,11 @@ class Exp_Main(Exp_Basic):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
-
-                outputs = self.model(batch_x)
+            for i, batch in enumerate(vali_loader):
+                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                outputs = self.model(batch)
                 
-                loss = criterion(outputs, batch_y)
+                loss = criterion(outputs, batch['observe_power_future'])
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()
@@ -103,15 +101,17 @@ class Exp_Main(Exp_Basic):
 
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            for i, batch in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
-                outputs = self.model(batch_x)
+                if self.args.model == 'FusionModel':
+                    outputs = self.model(batch)
+                else:
+                    outputs = self.model(batch)
 
-                loss = criterion(outputs, batch_y)
+                loss = criterion(outputs, batch['observe_power_future'])
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -158,22 +158,17 @@ class Exp_Main(Exp_Basic):
 
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+            for i, batch in enumerate(test_loader):
+                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                outputs = self.model(batch)
 
-                outputs = self.model(batch_x)
-
-                outputs = outputs.detach().cpu().numpy()
-                batch_y = batch_y.detach().cpu().numpy()
-
-                pred = outputs
-                true = batch_y
+                pred = outputs.detach().cpu().numpy()
+                true = batch['observe_power_future'].detach().cpu().numpy()
 
                 preds.append(pred)
                 trues.append(true)
                 if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
+                    input = batch['x'].detach().cpu().numpy()
                     gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))

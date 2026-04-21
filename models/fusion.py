@@ -57,30 +57,69 @@ class SoftMoELayer(nn.Module):
         out = torch.matmul(combine_weights, slots_output) # (B, N, D)
         return out
 
+class QueryGenerator(nn.Module):
+    """
+    Dynamically generates queries based on input data statistics (Mean, Std, Max, Min).
+    """
+    def __init__(self, n_features, num_queries, d_fusion):
+        super().__init__()
+        self.num_queries = num_queries
+        self.d_fusion = d_fusion
+        
+        # 4 stats per feature
+        input_dim = n_features * 4
+        
+        self.generator = nn.Sequential(
+            nn.Linear(input_dim, d_fusion),
+            nn.GELU(),
+            nn.Linear(d_fusion, num_queries * d_fusion),
+            nn.LayerNorm(num_queries * d_fusion)
+        )
+        
+    def forward(self, x):
+        # x: (B, L, C)
+        B, L, C = x.shape
+        
+        # 1. Global statistics extraction
+        mean = x.mean(dim=1) # (B, C)
+        std = x.std(dim=1)   # (B, C)
+        max_val, _ = x.max(dim=1) # (B, C)
+        min_val, _ = x.min(dim=1) # (B, C)
+        
+        stats = torch.cat([mean, std, max_val, min_val], dim=-1) # (B, 4C)
+        
+        # 2. Dynamic generation
+        queries = self.generator(stats) # (B, num_queries * d_fusion)
+        return queries.view(B, self.num_queries, self.d_fusion)
+
 class FusionModel(nn.Module):
     """
     Channel-Centric Fusion Architecture:
     1. Experts output (B, C, D) -> Time is embedded into D.
-    2. TokenPacker uses C queries to aggregate cross-model channel features.
+    2. TokenPacker uses C queries (Static or Dynamic) to aggregate features.
     3. Soft MoE performs differentiable expert fusion per channel token.
     4. Prediction head outputs final values in target space.
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
                  num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
-                 query_init_type='orthogonal'):
+                 query_init_type='orthogonal', use_dynamic_queries=True):
         super().__init__()
         self.models_dict = nn.ModuleDict(models_dict)
         self.device = device
         self.pred_len = pred_len
         self.n_features = n_features
-        self.query_init_type = query_init_type
+        self.use_dynamic_queries = use_dynamic_queries
 
         # Use n_features as default num_queries for channel-specific fusion
         self.num_queries = num_queries if num_queries is not None else n_features
 
         # --- Stage 1: TokenPacker (Injection) ---
-        self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
-        self._init_queries(query_init_type)
+        if self.use_dynamic_queries:
+            self.query_gen = QueryGenerator(n_features, self.num_queries, d_fusion)
+            self.queries = None
+        else:
+            self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
+            self._init_queries(query_init_type)
 
         self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
         self.norm1 = nn.LayerNorm(d_fusion)
@@ -92,13 +131,13 @@ class FusionModel(nn.Module):
                 param.requires_grad = False
             model.eval()
             
-            # Infer hidden dim from dummy pass with a dictionary input
+            # Infer hidden dim from dummy pass
             dummy_batch = {
                 'x': torch.zeros(1, seq_len, n_features).to(device),
                 'observe_power': torch.zeros(1, seq_len, n_features).to(device)
             }
             with torch.no_grad():
-                h = model.forward_hidden(dummy_batch) # Base models now handle dicts
+                h = model.forward_hidden(dummy_batch) 
                 self.projectors[name] = nn.Linear(h.shape[-1], d_fusion)
         
         # --- Stage 2: Soft MoE (Fusing) ---
@@ -116,20 +155,19 @@ class FusionModel(nn.Module):
 
     def _init_queries(self, init_type):
         """
-        Experimental initialization strategies for queries.
+        Experimental initialization strategies for static queries.
         """
         import math
+        if self.queries is None: return
         q = self.queries.data
         d_fusion = q.size(-1)
 
         if init_type == 'normal':
             nn.init.normal_(q, std=0.02)
-
         elif init_type == 'orthogonal':
             flat_q = torch.empty(self.num_queries, d_fusion)
             nn.init.orthogonal_(flat_q)
             q.copy_(flat_q.unsqueeze(0))
-
         elif init_type == 'fourier':
             for i in range(self.num_queries):
                 for j in range(d_fusion // 2):
@@ -137,23 +175,18 @@ class FusionModel(nn.Module):
                     q[0, i, 2 * j] = math.sin(val)
                     q[0, i, 2 * j + 1] = math.cos(val)
             q.mul_(0.02)
-
         elif init_type == 'kaiming':
             nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
-            
         elif init_type == 'xavier':
             flat_q = torch.empty(self.num_queries, d_fusion)
             nn.init.xavier_normal_(flat_q)
             q.copy_(flat_q.unsqueeze(0))
-            
         elif init_type == 'uniform':
             limit = math.sqrt(3.0 / d_fusion)
             nn.init.uniform_(q, -limit, limit)
-
         elif init_type == 'constant':
             nn.init.constant_(q, 1.0)
             q.add_(torch.randn_like(q) * 0.001)
-
         else:
             raise ValueError(f"Unknown query_init_type: {init_type}")
 
@@ -170,22 +203,25 @@ class FusionModel(nn.Module):
         kv = torch.cat(all_tokens, dim=1)
         B = kv.shape[0]
         
-        # 2. TokenPacker: Aggregate info from all models into channel queries
-        q = self.queries.expand(B, -1, -1)
+        # 2. Query Generation (Dynamic or Static)
+        if self.use_dynamic_queries:
+            q = self.query_gen(batch['x']) # (B, num_queries, d_fusion)
+        else:
+            q = self.queries.expand(B, -1, -1)
+            
+        # 3. TokenPacker: Aggregate info from all models into queries
         attn_out, _ = self.cross_attn(q, kv, kv)
         packed_tokens = self.norm1(q + attn_out) # (B, num_queries, d_fusion)
         
-        # 3. Soft MoE: Fuse features in the latent space
+        # 4. Soft MoE: Fuse features in the latent space
         fused_tokens = self.soft_moe(packed_tokens)
         fused_tokens = self.norm2(packed_tokens + fused_tokens)
         
-        # 4. Channel-wise prediction in latent space: (B, num_queries, pred_len)
-        # Apply dropout to regularize latent features
-        out = self.output_head(self.dropout(fused_tokens)) # (B, num_queries, pred_len)
+        # 5. Channel-wise prediction: (B, num_queries, pred_len)
+        out = self.output_head(self.dropout(fused_tokens)) 
         
-        # 5. Information Aggregation: Map queries to actual feature count
-        # (B, num_queries, pred_len) -> (B, n_features, pred_len)
+        # 6. Information Aggregation: Map queries to actual feature count
         output = self.aggregate(out)
         
-        # 6. Final output formatting: (B, n_features, pred_len) -> (B, pred_len, n_features)
+        # 7. Final output formatting
         return output.transpose(1, 2)

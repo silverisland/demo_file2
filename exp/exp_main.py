@@ -61,8 +61,27 @@ class Exp_Main(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        # Composite Loss for PV Power: Huber + Trend (1st-order difference)
+        # Huber is robust to outliers (cloud cover spikes)
+        # Trend loss handles distribution shifts by focusing on the change rate
+        huber = nn.HuberLoss(delta=1.0)
+        mse = nn.MSELoss()
+        
+        def composite_loss(pred, target):
+            # 1. Base robust regression loss
+            loss_val = huber(pred, target)
+            
+            # 2. Trend (Ramp) loss: focuses on the shape/change rate
+            # Pred/Target shape: (B, P, C)
+            if pred.shape[1] > 1:
+                diff_pred = pred[:, 1:, :] - pred[:, :-1, :]
+                diff_target = target[:, 1:, :] - target[:, :-1, :]
+                loss_trend = mse(diff_pred, diff_target)
+                return loss_val + 0.5 * loss_trend # lambda=0.5
+            
+            return loss_val
+            
+        return composite_loss
 
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []

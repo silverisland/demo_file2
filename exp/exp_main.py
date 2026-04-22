@@ -68,14 +68,19 @@ class Exp_Main(Exp_Basic):
         mse = nn.MSELoss()
         
         def composite_loss(pred, target):
+            # TabM adaptation: if pred is (n_heads, B, P, C), expand target to match
+            if pred.dim() == 4:
+                # (B, P, C) -> (n_heads, B, P, C)
+                target = target.unsqueeze(0).expand(pred.size(0), -1, -1, -1)
+
             # 1. Base robust regression loss
             loss_val = huber(pred, target)
             
             # 2. Trend (Ramp) loss: focuses on the shape/change rate
-            # Handles both (B, P) and (B, P, C)
-            if pred.shape[1] > 1:
-                diff_pred = pred[:, 1:] - pred[:, :-1]
-                diff_target = target[:, 1:] - target[:, :-1]
+            # Handles (B, P, C) or (n_heads, B, P, C)
+            if pred.shape[-2] > 1:
+                diff_pred = pred[..., 1:, :] - pred[..., :-1, :]
+                diff_target = target[..., 1:, :] - target[..., :-1, :]
                 loss_trend = mse(diff_pred, diff_target)
                 return loss_val + 0.5 * loss_trend # lambda=0.5
             

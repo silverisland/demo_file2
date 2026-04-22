@@ -57,15 +57,23 @@ class SoftMoELayer(nn.Module):
         out = torch.matmul(combine_weights, slots_output) # (B, N, D)
         return out
 
-class FlattenMapper(nn.Module):
+class DeepFlattenMapper(nn.Module):
     """
-    Aligns expert outputs (B, C, D) or (B, C, P, D) to a unified (B, Token, d_fusion).
-    Flattens the last two dimensions (P and D) for 4D inputs.
+    Advanced mapper that uses a bottleneck MLP to align expert outputs.
+    Adds non-linear capacity (GELU) and regularization (Dropout).
     """
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, dropout=0.2):
         super().__init__()
-        self.proj = nn.Linear(input_dim, output_dim)
-        self.norm = nn.LayerNorm(output_dim)
+        # Use a hidden dimension that balances capacity and compression
+        hidden_dim = max(input_dim // 4, output_dim * 2)
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
 
     def forward(self, x):
         # x shape: (B, C, D) or (B, C, P, D)
@@ -73,7 +81,34 @@ class FlattenMapper(nn.Module):
             B, C, P, D = x.shape
             x = x.reshape(B, C, -1) # (B, C, P*D)
         
-        return self.norm(self.proj(x))
+        return self.net(x)
+
+class MultiHeadPredictor(nn.Module):
+    """
+    Inspired by TabM's multi-hypothesis ensemble. 
+    Uses multiple independent heads to generate predictions.
+    Training: returns (n_heads, B, Q, P)
+    Inference: returns (B, Q, P) via averaging
+    """
+    def __init__(self, d_fusion, pred_len, n_heads=4, dropout=0.2):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(d_fusion, pred_len)
+            ) for _ in range(n_heads)
+        ])
+        
+    def forward(self, x):
+        # x: (B, num_queries, d_fusion)
+        # Stack predictions from all heads: (n_heads, B, num_queries, pred_len)
+        preds = torch.stack([head(x) for head in self.heads], dim=0)
+        
+        if self.training:
+            return preds
+        else:
+            # Average across heads to get the final robust prediction
+            return preds.mean(dim=0)
 
 class QueryGenerator(nn.Module):
     """
@@ -120,13 +155,15 @@ class FusionModel(nn.Module):
     """
     def __init__(self, models_dict, seq_len, pred_len, n_features, 
                  num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
-                 query_init_type='orthogonal', use_dynamic_queries=True):
+                 query_init_type='orthogonal', use_dynamic_queries=True,
+                 dropout=0.1):
         super().__init__()
         self.models_dict = nn.ModuleDict(models_dict)
         self.device = device
         self.pred_len = pred_len
         self.n_features = n_features
         self.use_dynamic_queries = use_dynamic_queries
+        self.dropout_rate = dropout
 
         # Use n_features as default num_queries for channel-specific fusion
         self.num_queries = num_queries if num_queries is not None else n_features
@@ -163,15 +200,15 @@ class FusionModel(nn.Module):
                     in_dim = h.shape[2] * h.shape[3]
                 else:
                     in_dim = h.shape[-1]
-                self.projectors[name] = FlattenMapper(in_dim, d_fusion)
+                self.projectors[name] = DeepFlattenMapper(in_dim, d_fusion, dropout=self.dropout_rate)
         
         # --- Stage 2: Soft MoE (Fusing) ---
         self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
         self.norm2 = nn.LayerNorm(d_fusion)
         
         # --- Stage 3: Prediction Head ---
-        self.output_head = nn.Linear(d_fusion, pred_len)
-        self.dropout = nn.Dropout(0.1) # Prevent overfitting in latent space
+        # TabM-inspired Multi-head prediction for robust results
+        self.output_head = MultiHeadPredictor(d_fusion, pred_len, n_heads=4, dropout=self.dropout_rate)
 
         # Aggregation layer: Map num_queries back to actual n_features
         self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
@@ -242,11 +279,19 @@ class FusionModel(nn.Module):
         fused_tokens = self.soft_moe(packed_tokens)
         fused_tokens = self.norm2(packed_tokens + fused_tokens)
         
-        # 5. Channel-wise prediction: (B, num_queries, pred_len)
-        out = self.output_head(self.dropout(fused_tokens)) 
+        # 5. TabM-style multi-head prediction: (n_heads, B, Q, P) or (B, Q, P)
+        out = self.output_head(fused_tokens) 
         
         # 6. Information Aggregation: Map queries to actual feature count
-        output = self.aggregate(out)
-        
-        # 7. Final output formatting
-        return output.transpose(1, 2)
+        if out.dim() == 4: # Training mode: (n_heads, B, Q, P)
+            n_heads, B, Q, P = out.shape
+            # Flatten heads into batch dimension for aggregate layer: (n_heads*B, Q, P)
+            out_flat = out.view(n_heads * B, Q, P)
+            output = self.aggregate(out_flat) # (n_heads*B, n_features, P)
+            # Reshape back: (n_heads, B, n_features, P)
+            output = output.view(n_heads, B, self.n_features, P)
+            # Final output formatting: (n_heads, B, P, n_features)
+            return output.transpose(2, 3)
+        else: # Inference mode: (B, Q, P)
+            output = self.aggregate(out) # (B, n_features, P)
+            return output.transpose(1, 2) # (B, P, n_features)

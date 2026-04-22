@@ -72,10 +72,10 @@ class Exp_Main(Exp_Basic):
             loss_val = huber(pred, target)
             
             # 2. Trend (Ramp) loss: focuses on the shape/change rate
-            # Pred/Target shape: (B, P, C)
+            # Handles both (B, P) and (B, P, C)
             if pred.shape[1] > 1:
-                diff_pred = pred[:, 1:, :] - pred[:, :-1, :]
-                diff_target = target[:, 1:, :] - target[:, :-1, :]
+                diff_pred = pred[:, 1:] - pred[:, :-1]
+                diff_target = target[:, 1:] - target[:, :-1]
                 loss_trend = mse(diff_pred, diff_target)
                 return loss_val + 0.5 * loss_trend # lambda=0.5
             

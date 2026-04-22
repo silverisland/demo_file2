@@ -57,6 +57,37 @@ class SoftMoELayer(nn.Module):
         out = torch.matmul(combine_weights, slots_output) # (B, N, D)
         return out
 
+class AdaptiveMapper(nn.Module):
+    """
+    Aligns expert outputs (B, C, D) or (B, C, P, D) to a unified (B, C, d_fusion).
+    Uses adaptive pooling to handle varying patch numbers.
+    """
+    def __init__(self, input_dim, output_dim, target_patch=1):
+        super().__init__()
+        self.target_patch = target_patch
+        self.feature_proj = nn.Linear(input_dim, output_dim)
+        self.pool = nn.AdaptiveAvgPool1d(target_patch)
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x):
+        # x shape: (B, C, D) or (B, C, P, D)
+        if x.dim() == 4:
+            B, C, P, D = x.shape
+            # 1. Project features: (B, C, P, D) -> (B, C, P, output_dim)
+            x = self.feature_proj(x)
+            # 2. Pool over Patch dimension: (B*C, P, out_dim) -> (B*C, out_dim, P) -> (B*C, out_dim, target_patch)
+            x = x.view(-1, P, x.shape[-1]).transpose(1, 2)
+            x = self.pool(x).transpose(1, 2)
+            # 3. Reshape: (B, C, target_patch, output_dim)
+            x = x.view(B, C, self.target_patch, x.shape[-1])
+            if self.target_patch == 1:
+                x = x.squeeze(2) # (B, C, output_dim)
+        else:
+            # x shape: (B, C, D)
+            x = self.feature_proj(x)
+        
+        return self.norm(x)
+
 class QueryGenerator(nn.Module):
     """
     Dynamically generates queries based on input data statistics (Mean, Std, Max, Min).
@@ -138,7 +169,7 @@ class FusionModel(nn.Module):
             }
             with torch.no_grad():
                 h = model.forward_hidden(dummy_batch) 
-                self.projectors[name] = nn.Linear(h.shape[-1], d_fusion)
+                self.projectors[name] = AdaptiveMapper(h.shape[-1], d_fusion)
         
         # --- Stage 2: Soft MoE (Fusing) ---
         self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)

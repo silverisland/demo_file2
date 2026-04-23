@@ -37,26 +37,53 @@ class ExpertModelDemo(nn.Module):
 
 def extract_and_save_features(model, dataloader, save_path, device='cpu'):
     """
-    Extract hidden features and save to a .npy file.
+    Extract hidden features and save to a .npy file using memory mapping (memmap)
+    to avoid memory overflows with large datasets.
     """
     model.to(device)
     model.eval()
-    all_hiddens = []
     
-    print(f"Extracting features to {save_path}...")
+    num_samples = len(dataloader.dataset)
+    
+    # 1. Infer dimensions from a dummy pass of the first batch
+    first_batch = next(iter(dataloader))
+    first_batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                          for k, v in first_batch.items()}
+    with torch.no_grad():
+        dummy_output = model.forward_hidden(first_batch_device)
+        # dummy_output shape is (B, L, D) or (B, C, P, D) -> we need (L, D) or (C, P, D)
+        feature_shape = dummy_output.shape[1:] 
+        d_model = dummy_output.shape[-1]
+    
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    # 2. Create a memory-mapped array (pre-allocates disk space)
+    # Final shape: (Num_Samples, *Feature_Shape)
+    full_shape = (num_samples, *feature_shape)
+    fp = np.memmap(save_path, dtype='float32', mode='w+', shape=full_shape)
+    
+    print(f"Allocated memmap at {save_path} with shape {full_shape}")
+    
+    idx = 0
     with torch.no_grad():
         for batch in dataloader:
-            # Move batch to device
             batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                             for k, v in batch.items()}
-            hidden = model.forward_hidden(batch_device)
-            all_hiddens.append(hidden.cpu().numpy())
+            hidden = model.forward_hidden(batch_device).cpu().numpy()
+            
+            batch_size = hidden.shape[0]
+            # 3. Direct write to disk slice
+            fp[idx : idx + batch_size] = hidden
+            idx += batch_size
+            
+            if (idx // batch_size) % 10 == 0:
+                print(f"  Progress: {idx}/{num_samples} samples saved.")
     
-    final_features = np.concatenate(all_hiddens, axis=0)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    np.save(save_path, final_features)
-    print(f"Saved {final_features.shape} features.")
-    return final_features.shape
+    # 4. Flush and close
+    fp.flush()
+    del fp 
+    print(f"Extraction complete. File size: {os.path.getsize(save_path)/1024/1024:.2f} MB")
+    return full_shape
 
 def run_demo():
     # 1. Create dummy data

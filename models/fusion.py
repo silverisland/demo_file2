@@ -292,6 +292,140 @@ class FusionModel(nn.Module):
             output = output.view(n_heads, B, self.n_features, P)
             # Final output formatting: (n_heads, B, P, n_features)
             return output.transpose(2, 3)
+        # Inference mode: (B, Q, P)
+        output = self.aggregate(out) # (B, n_features, P)
+        return output.transpose(1, 2) # (B, P, n_features)
+
+class FusionFeatureModel(nn.Module):
+    """
+    Same architecture as FusionModel, but accepts pre-computed hidden states (tensors)
+    directly. This is used for fast iteration on the fusion architecture.
+    """
+    def __init__(self, expert_dims, pred_len, n_features, 
+                 num_queries=None, d_fusion=256, num_experts=4, device='cpu', 
+                 query_init_type='orthogonal', use_dynamic_queries=True,
+                 dropout=0.1):
+        super().__init__()
+        self.device = device
+        self.pred_len = pred_len
+        self.n_features = n_features
+        self.use_dynamic_queries = use_dynamic_queries
+        self.dropout_rate = dropout
+        self.expert_names = list(expert_dims.keys())
+
+        # Use n_features as default num_queries for channel-specific fusion
+        self.num_queries = num_queries if num_queries is not None else n_features
+
+        # --- Stage 1: TokenPacker (Injection) ---
+        if self.use_dynamic_queries:
+            self.query_gen = QueryGenerator(n_features, self.num_queries, d_fusion)
+            self.queries = None
+        else:
+            self.queries = nn.Parameter(torch.empty(1, self.num_queries, d_fusion))
+            self._init_queries(query_init_type)
+
+        self.cross_attn = nn.MultiheadAttention(d_fusion, num_heads=8, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_fusion)
+        
+        # Individual projectors to align base model outputs (B, C, D_i) -> (B, C, d_fusion)
+        self.projectors = nn.ModuleDict()
+        for name, in_dim in expert_dims.items():
+            self.projectors[name] = DeepFlattenMapper(in_dim, d_fusion, dropout=self.dropout_rate)
+        
+        # --- Stage 2: Soft MoE (Fusing) ---
+        self.soft_moe = SoftMoELayer(d_fusion, num_experts=num_experts, slots_per_expert=4)
+        self.norm2 = nn.LayerNorm(d_fusion)
+        
+        # --- Stage 3: Prediction Head ---
+        self.output_head = MultiHeadPredictor(d_fusion, pred_len, n_heads=4, dropout=self.dropout_rate)
+
+        # Aggregation layer: Map num_queries back to actual n_features
+        self.aggregate = nn.Conv1d(self.num_queries, self.n_features, 1)
+        
+        self.to(device)
+
+    def _init_queries(self, init_type):
+        """
+        Copied from FusionModel for consistency.
+        """
+        import math
+        if self.queries is None: return
+        q = self.queries.data
+        d_fusion = q.size(-1)
+
+        if init_type == 'normal':
+            nn.init.normal_(q, std=0.02)
+        elif init_type == 'orthogonal':
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.orthogonal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+        elif init_type == 'fourier':
+            for i in range(self.num_queries):
+                for j in range(d_fusion // 2):
+                    val = i / math.pow(10000, 2 * j / d_fusion)
+                    q[0, i, 2 * j] = math.sin(val)
+                    q[0, i, 2 * j + 1] = math.cos(val)
+            q.mul_(0.02)
+        elif init_type == 'kaiming':
+            nn.init.kaiming_normal_(q, mode='fan_in', nonlinearity='leaky_relu')
+        elif init_type == 'xavier':
+            flat_q = torch.empty(self.num_queries, d_fusion)
+            nn.init.xavier_normal_(flat_q)
+            q.copy_(flat_q.unsqueeze(0))
+        elif init_type == 'uniform':
+            limit = math.sqrt(3.0 / d_fusion)
+            nn.init.uniform_(q, -limit, limit)
+        elif init_type == 'constant':
+            nn.init.constant_(q, 1.0)
+            q.add_(torch.randn_like(q) * 0.001)
+        else:
+            raise ValueError(f"Unknown query_init_type: {init_type}")
+
+    def forward(self, hidden_dict, x_input=None):
+        """
+        hidden_dict: {expert_name: (B, C, D) or (B, C, P, D)}
+        x_input: (B, L, C) original input for dynamic query generation
+        """
+        # 1. Align and project base model outputs
+        all_tokens = []
+        for name in self.expert_names:
+            h = hidden_dict[name]
+            proj_h = self.projectors[name](h)
+            all_tokens.append(proj_h)
+        
+        # Concatenate tokens from all experts: (B, Num_Models * C, d_fusion)
+        kv = torch.cat(all_tokens, dim=1)
+        B = kv.shape[0]
+        
+        # 2. Query Generation (Dynamic or Static)
+        if self.use_dynamic_queries:
+            if x_input is None:
+                raise ValueError("Dynamic queries require x_input (original feature data).")
+            q = self.query_gen(x_input) # (B, num_queries, d_fusion)
+        else:
+            q = self.queries.expand(B, -1, -1)
+            
+        # 3. TokenPacker: Aggregate info from all models into queries
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        packed_tokens = self.norm1(q + attn_out) # (B, num_queries, d_fusion)
+        
+        # 4. Soft MoE: Fuse features in the latent space
+        fused_tokens = self.soft_moe(packed_tokens)
+        fused_tokens = self.norm2(packed_tokens + fused_tokens)
+        
+        # 5. TabM-style multi-head prediction: (n_heads, B, Q, P) or (B, Q, P)
+        out = self.output_head(fused_tokens) 
+        
+        # 6. Information Aggregation: Map queries to actual feature count
+        if out.dim() == 4: # Training mode: (n_heads, B, Q, P)
+            n_heads, B, Q, P = out.shape
+            # Flatten heads into batch dimension for aggregate layer: (n_heads*B, Q, P)
+            out_flat = out.view(n_heads * B, Q, P)
+            output = self.aggregate(out_flat) # (n_heads*B, n_features, P)
+            # Reshape back: (n_heads, B, n_features, P)
+            output = output.view(n_heads, B, self.n_features, P)
+            # Final output formatting: (n_heads, B, P, n_features)
+            return output.transpose(2, 3)
         else: # Inference mode: (B, Q, P)
             output = self.aggregate(out) # (B, n_features, P)
             return output.transpose(1, 2) # (B, P, n_features)

@@ -20,6 +20,9 @@ class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
 
+    def _move_to_device(self, batch):
+        return {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
     def _build_model(self):
         model_dict = {
             'M1': DLinear,
@@ -101,7 +104,7 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
-                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                batch = self._move_to_device(batch)
                 outputs = self.model(batch)
                 
                 loss = criterion(outputs, batch['observe_power_future'])
@@ -135,7 +138,7 @@ class Exp_Main(Exp_Basic):
             for i, batch in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                batch = self._move_to_device(batch)
 
                 outputs = self.model(batch)
 
@@ -186,7 +189,7 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
-                batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+                batch = self._move_to_device(batch)
                 outputs = self.model(batch)
 
                 pred = outputs.detach().cpu().numpy()
@@ -205,6 +208,6 @@ class Exp_Main(Exp_Basic):
         result_df['timestamp_win'] = test_data.timestamp 
         result_df['observe_power_predict'] = [x for x in preds]
         result_df['observe_power_future'] = [x for x in trues]
-        result_df.to_parquet('result_df.parquet', index = False)
+        result_df.to_parquet(f'results_{setting}.parquet', index = False)
 
         return

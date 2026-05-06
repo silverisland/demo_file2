@@ -159,6 +159,11 @@ class FusionModel(nn.Module):
             raise ValueError(f"Unknown query initialization type: {init_type}")                    
 
     def forward(self, batch):
+
+        #已知model 2的输出维度为(B, 2, 512)
+        #已知model 3的输出维度为(B, 5, 9, 256)
+        #已知model 4的输出维度为(B, 164, 384)
+
         B = batch['observe_power'].shape[0]
 
         # 1. Distill features from each expert

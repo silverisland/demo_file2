@@ -304,6 +304,3 @@ class FusionModelV4(nn.Module):
             return loss_val + 0.5 * loss_trend
 
         return loss_val
-
-
-FusionModel = FusionModelV4

@@ -104,6 +104,7 @@ class FusionModel(nn.Module):
         self.pred_len = pred_len
         self.n_features = n_features
        
+        self.expert_names = ['m1','m2','m3','m4']
         self.num_queries = num_queries if num_queries is not None else n_features
 
         self.use_dynamic_queries = True 
@@ -158,27 +159,25 @@ class FusionModel(nn.Module):
         else:
             raise ValueError(f"Unknown query initialization type: {init_type}")                    
 
-    def forward(self, batch):
+    def forward(self, batch_tensor, batch):
 
         #已知model 2的输出维度为(B, 2, 512)
         #已知model 3的输出维度为(B, 5, 9, 256)
         #已知model 4的输出维度为(B, 164, 384)
 
-        B = batch['observe_power'].shape[0]
+        
 
         # 1. Distill features from each expert
         all_tokens = []
-        for name, model in self.models_dict.items():
-            model.eval() 
-            with torch.no_grad():
-                h = model.forward_hidden(batch) 
-            
+        for name in self.expert_names:
+            h = batch_tensor[name]
             h = h.flatten(1).unsqueeze(1)
-            # The projector must be outside no_grad to update its weights
             proj_h = self.projectors[name](h)
             all_tokens.append(proj_h)
         
         kv = torch.cat(all_tokens, dim = 1)
+        B = kv.shape[0]
+        
         if self.use_dynamic_queries:
             q = self.query_gen(batch['observe_power'].unsqueeze(-1))
         else:

@@ -24,6 +24,7 @@ python -u run_longExp.py \
   --is_training 1 \
   --model_id dummy_test \
   --model FusionModel \
+  --fusion_version base \
   --data custom \
   --features M \
   --seq_len 96 \

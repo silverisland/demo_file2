@@ -2,7 +2,6 @@ import argparse
 import os
 import torch
 import pandas as pd
-from exp.exp_main import Exp_Main
 import random
 import numpy as np
 
@@ -19,6 +18,23 @@ def main():
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
+    parser.add_argument('--fusion_version', type=str, default='base',
+                        choices=['base', 'expert_head', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        help='fusion model version selected by models/factory.py')
+    parser.add_argument('--fusion_expert_name', type=str, default='m1',
+                        choices=['m1', 'm2', 'm3', 'm4'],
+                        help='single expert used by expert_head reconstruction')
+    parser.add_argument('--fusion_d_model', type=int, default=None,
+                        help='fusion hidden dimension override')
+    parser.add_argument('--fusion_dropout', type=float, default=None,
+                        help='fusion dropout override')
+    parser.add_argument('--fusion_expert_dims', type=str, default=None,
+                        help="expert hidden dims, e.g. 'm1:512,m2:256,m3:384,m4:512'")
+    parser.add_argument('--fusion_loss', type=str, default=None,
+                        choices=['mse', 'mae', 'huber'],
+                        help='loss type for fusion versions that support it')
+    parser.add_argument('--target_key', type=str, default='observe_power_future',
+                        help='target tensor key used by fusion models')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -35,7 +51,8 @@ def main():
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
+    parser.add_argument('--lradj', type=str, default='type3', help='adjust learning rate')
+    parser.add_argument('--pct_start', type=float, default=0.3, help='pct start')
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -57,12 +74,15 @@ def main():
     print('Args in experiment:')
     print(args)
 
+    from exp.exp_main import Exp_Main
+
     Exp = Exp_Main
 
     # Setting record of experiments
-    setting = '{}_{}_{}_sl{}_pl{}_lr{}_{}'.format(
+    setting = '{}_{}_{}_{}_sl{}_pl{}_lr{}_{}'.format(
         args.model_id,
         args.model,
+        args.fusion_version,
         args.data,
         args.seq_len,
         args.pred_len,

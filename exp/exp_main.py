@@ -1,8 +1,19 @@
 from data_provider.fusion_dataset import data_provider
 from exp.exp_basic import Exp_Basic
-from models import FusionModel, DLinear, PatchTST, iTransformer, TimesNet
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric
+
+from models.factory import build_fusion_model
+    
+# M1
+from individual_models.fourier_moba_transformer.model import FourierMoBAPatchTST_V2
+# M2
+from individual_models.ylj_patchreg.src.experiments.ghi_reg import ExpFlexGHIReg
+# M3
+from individual_models.pv_forecast_moirai.src.grinder import create_model_wrapper
+from individual_models.pv_forecast_moirai.src.utils.datatype import DDPConfig
+# M4
+from individual_models.m4_full_version.exp.exp_main import Exp_Main as m4_exp_main
 
 import numpy as np
 import pandas as pd
@@ -25,37 +36,34 @@ class Exp_Main(Exp_Basic):
 
     def _build_model(self):
         model_dict = {
-            'M1': DLinear,
-            'M2': PatchTST,
-            'M3': iTransformer,
-            'M4': TimesNet,
+            'M1': FourierMoBAPatchTST_V2,
+            'M2': ExpFlexGHIReg,
+            'M3': create_model_wrapper,
+            'M4': m4_exp_main,
         }
         
-        if self.args.model == 'FusionModel':
-            # Load base models
-            base_models = {}
+        base_models = {}
 
-            with open('./configs/m1config.yaml', 'r', encoding = 'utf-8') as f:
-                config1 = yaml.safe_load(f)
-            with open('./configs/m2config.yaml', 'r', encoding = 'utf-8') as f:
-                config2 = yaml.safe_load(f)
-            with open('./configs/m3config.yaml', 'r', encoding = 'utf-8') as f:
-                config3 = yaml.safe_load(f)
-            with open('./configs/m4config.yaml', 'r', encoding = 'utf-8') as f:
-                config4 = yaml.safe_load(f)
+        with open('./configs/m1config.yaml', 'r', encoding = 'utf-8') as f:
+            config1 = yaml.safe_load(f)
+        with open('./configs/m2config.yaml', 'r', encoding = 'utf-8') as f:
+            config2 = yaml.safe_load(f)
+        with open('./configs/m3config.yaml', 'r', encoding = 'utf-8') as f:
+            config3 = yaml.safe_load(f)
+        with open('./configs/m4config.yaml', 'r', encoding = 'utf-8') as f:
+            config4 = yaml.safe_load(f)
             
-            if 'M1' in model_dict.keys():
-                base_models['m1'] = model_dict['M1'](config1)
-            if 'M2' in model_dict.keys():
-                base_models['m2'] = model_dict['M2'](config2) 
-            if 'M3' in model_dict.keys():
-                base_models['m3'] = model_dict['M3'](config3)
-            if 'M4' in model_dict.keys():
-                base_models['m4'] = model_dict['M4'](config4)
+        if 'M1' in model_dict.keys():
+            base_models['m1'] = model_dict['M1'](config1)
+        if 'M2' in model_dict.keys():
+            base_models['m2'] = model_dict['M2'](config2).network
+        if 'M3' in model_dict.keys():
+            ddp_config = DDPConfig()
+            base_models['m3'] = model_dict['M3'](config3, ddp_config)
+        if 'M4' in model_dict.keys():
+            base_models['m4'] = model_dict['M4'](config4).model
 
-            model = FusionModel(base_models, self.args.seq_len, self.args.pred_len, self.args.enc_in, device=self.device).float()
-        else:
-            model = model_dict[self.args.model](self.args.seq_len, self.args.pred_len).float()
+        model = build_fusion_model(self.args, base_models, self.device)
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -66,40 +74,13 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        if self.args.model == 'FusionModel':
-            # Optimize all trainable parameters (fusion layers)
-            model_optim = optim.Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()), 
-                lr=self.args.learning_rate
-                )
-        else:
-            model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        model_optim = optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()), 
+            lr=self.args.learning_rate
+        )
         return model_optim
 
-    def _select_criterion(self):
-        # Composite Loss for PV Power: Huber + Trend (1st-order difference)
-        # Huber is robust to outliers (cloud cover spikes)
-        # Trend loss handles distribution shifts by focusing on the change rate
-        huber = nn.HuberLoss(delta=1.0)
-        mse = nn.MSELoss()
-        
-        def composite_loss(pred, target):
-            # 1. Base robust regression loss
-            loss_val = huber(pred, target)
-            
-            # 2. Trend (Ramp) loss: focuses on the shape/change rate
-            # Handles (B, P, C) or (n_heads, B, P, C)
-            if pred.shape[1] > 1:
-                diff_pred = pred[:, 1:] - pred[:, :-1]
-                diff_target = target[:, 1:] - target[:, :-1]
-                loss_trend = mse(diff_pred, diff_target)
-                return loss_val + 0.5 * loss_trend # lambda=0.5
-            
-            return loss_val
-            
-        return composite_loss
-
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_data, vali_loader):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
@@ -127,7 +108,11 @@ class Exp_Main(Exp_Basic):
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer=model_optim, 
+                                                    max_lr=self.args.learning_rate, 
+                                                    steps_per_epoch=train_steps, 
+                                                    epochs=self.args.train_epochs,
+                                                    pct_start=self.args.pct_start)
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -140,9 +125,7 @@ class Exp_Main(Exp_Basic):
                 model_optim.zero_grad()
                 batch = self._move_to_device(batch)
 
-                outputs = self.model(batch)
-
-                loss = criterion(outputs, batch['observe_power_future'])
+                outputs, loss = self.model(batch, flag = 'train')
                 train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
@@ -156,9 +139,12 @@ class Exp_Main(Exp_Basic):
                 loss.backward()
                 model_optim.step()
 
+                adjust_learning_rate(model_optim, epoch + 1, self.args, printout = False)
+                scheduler.step()    
+
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            vali_loss = self.vali(vali_data, vali_loader)
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
                 epoch + 1, train_steps, train_loss, vali_loss))
@@ -190,7 +176,7 @@ class Exp_Main(Exp_Basic):
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
                 batch = self._move_to_device(batch)
-                outputs = self.model(batch)
+                outputs = self.model(batch, flag = 'test')
 
                 pred = outputs.detach().cpu().numpy()
                 true = batch['observe_power_future'].detach().cpu().numpy()

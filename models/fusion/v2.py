@@ -138,7 +138,7 @@ class FusionModel(nn.Module):
             self.projectors[name] = nn.Sequential(
                 nn.Linear(in_dim, d_fusion),
                 nn.GELU(),
-                nn.Linear(d_fusion, d_fusion)
+                nn.Linear(d_fusion, d_fion)
             )
             self.proj_norms[name] = nn.LayerNorm(d_fusion)
 

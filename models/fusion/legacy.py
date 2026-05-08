@@ -104,7 +104,6 @@ class FusionModel(nn.Module):
         self.pred_len = pred_len
         self.n_features = n_features
        
-       self.expert_names = ['m1','m2','m3','m4']
         self.num_queries = num_queries if num_queries is not None else n_features
 
         self.use_dynamic_queries = True 
@@ -121,15 +120,25 @@ class FusionModel(nn.Module):
 
         # Individual projectors to summarize base models
         self.projectors = nn.ModuleDict()
+        self.proj_norms = nn.ModuleDict() 
+
         for name, model in self.models_dict.items():
             for param in model.parameters():
                 param.requires_grad = False
             model.eval()
-            if name == 'm1': self.projectors[name] = nn.Linear(512, d_fusion) # Added m1 support
-            if name == 'm2': self.projectors[name] = nn.Linear(1024, d_fusion)
-            if name == 'm3': self.projectors[name] = nn.Linear(62208, d_fusion)
-            if name == 'm4': self.projectors[name] = nn.Linear(11520, d_fusion)
 
+            if name == 'm1': in_dim = 512 
+            if name == 'm2': in_dim = 1024
+            if name == 'm3': in_dim = 62208
+            if name == 'm4': in_dim = 11520
+            
+            self.proj_norms[name] = nn.Sequential(
+                nn.Linear(in_dim, d_fusion),
+                nn.GELU(),
+                nn.Linear(d_fusion, d_fusion),
+            )
+            self.projectors[name] = nn.Laynorm(d_fusion)
+        
         self.soft_moe = SoftMoELayer(d_fusion, num_experts = num_experts, slots_per_expert = 4)
         self.norm2 = nn.LayerNorm(d_fusion)
 
@@ -159,29 +168,33 @@ class FusionModel(nn.Module):
         else:
             raise ValueError(f"Unknown query initialization type: {init_type}")                    
 
-    def forward(self, batch_tensor, batch):
+    def forward(self, batch, flag = 'test'):
 
         #已知model 2的输出维度为(B, 2, 512)
         #已知model 3的输出维度为(B, 5, 9, 256)
         #已知model 4的输出维度为(B, 164, 384)
 
-        
+        B = batch['observe_power'].shape[0]
 
         # 1. Distill features from each expert
         all_tokens = []
-        for name in self.expert_names:
-            h = batch_tensor[name]
+        for name, model in self.models_dict.items():
+            model.eval() 
+            with torch.no_grad():
+                h = model.forward_hidden(batch) 
+            
             h = h.flatten(1).unsqueeze(1)
+            # The projector must be outside no_grad to update its weights
             proj_h = self.projectors[name](h)
+            proj_h = self.proj_norms[name](proj_h)
             all_tokens.append(proj_h)
         
         kv = torch.cat(all_tokens, dim = 1)
-        B = kv.shape[0]
-        
         if self.use_dynamic_queries:
             q = self.query_gen(batch['observe_power'].unsqueeze(-1))
         else:
             q = self.queries.expand(B, -1, -1)
+
         attn_out, _ = self.cross_attn(q, kv, kv)
         packed_tokens = self.norm1(q + attn_out)
         
@@ -197,4 +210,19 @@ class FusionModel(nn.Module):
         else:
             output = self.aggregate(out).squeeze(1)
         
-        return output
+        if flag == 'test':
+            return output
+        else:
+            return output, self.loss_func(output, batch['target_power'])
+    
+    def loss_func(self, pred, target):
+        huber = nn.HuberLoss(delta = 1.0)
+        mse = nn.MSELoss()
+        loss_val = huber(pred, target)
+
+        if pred.shape[-1] > 1:
+            diff_pred = pred[:, 1:] - pred[:, :-1]
+            diff_target = target[:, 1:] - target[:, :-1]
+            loss_trend = mse(diff_pred, diff_target)
+        
+        return loss_val + 0.5 * loss_trend

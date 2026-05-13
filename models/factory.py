@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .fusion.base import FusionBase
-from .fusion.expert_head import ExpertHeadReconstruction
+from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -16,6 +16,7 @@ from .fusion.v5 import FusionModelV5
 FUSION_REGISTRY = {
     "base": FusionBase,
     "expert_head": ExpertHeadReconstruction,
+    "multi_expert_head": MultiExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -25,7 +26,14 @@ FUSION_REGISTRY = {
 }
 
 DEFAULT_FUSION_VERSION = "base"
-HIDDEN_ONLY_FUSION_VERSIONS = {"base", "expert_head", "v4", "v5", "tensor_v3"}
+HIDDEN_ONLY_FUSION_VERSIONS = {
+    "base",
+    "expert_head",
+    "multi_expert_head",
+    "v4",
+    "v5",
+    "tensor_v3",
+}
 
 
 class FusionModelWithExperts(nn.Module):
@@ -113,6 +121,7 @@ def build_fusion_model(args, base_models=None, device=None):
     target_key = getattr(args, "target_key", None)
     loss_type = getattr(args, "fusion_loss", None)
     expert_name = getattr(args, "fusion_expert_name", None)
+    aux_loss_weight = getattr(args, "fusion_aux_loss_weight", None)
 
     constructor_kwargs = {
         "models_dict": base_models,
@@ -125,6 +134,7 @@ def build_fusion_model(args, base_models=None, device=None):
         "target_key": target_key,
         "loss_type": loss_type,
         "expert_name": expert_name,
+        "aux_loss_weight": aux_loss_weight,
         "device": device,
     }
     constructor_kwargs = _filter_constructor_kwargs(model_cls, constructor_kwargs)

@@ -76,7 +76,8 @@ class Exp_Main(Exp_Basic):
     def _select_optimizer(self):
         model_optim = optim.Adam(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
-            lr=self.args.learning_rate
+            lr=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
         )
         return model_optim
 
@@ -86,9 +87,8 @@ class Exp_Main(Exp_Basic):
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
                 batch = self._move_to_device(batch)
-                outputs = self.model(batch)
+                outputs, loss = self.model(batch, flag = 'train')
                 
-                loss = criterion(outputs, batch['observe_power_future'])
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()

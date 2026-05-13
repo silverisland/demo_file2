@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--fusion_loss', type=str, default=None,
                         choices=['mse', 'mae', 'huber'],
                         help='loss type for fusion versions that support it')
+    parser.add_argument('--fusion_aux_loss_weight', type=float, default=None,
+                        help='auxiliary expert-head loss weight for multi-head fusion')
     parser.add_argument('--target_key', type=str, default='observe_power_future',
                         help='target tensor key used by fusion models')
 
@@ -50,6 +52,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='optimizer weight decay')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--lradj', type=str, default='type3', help='adjust learning rate')
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct start')

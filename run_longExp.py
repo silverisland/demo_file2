@@ -52,7 +52,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
+    parser.add_argument('--optimizer', type=str, default='adam',
+                        choices=['adam', 'adamw', 'muon', 'moun'],
+                        help='optimizer type')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='optimizer weight decay')
+    parser.add_argument('--muon_momentum', type=float, default=0.95, help='Muon momentum')
+    parser.add_argument('--muon_ns_steps', type=int, default=5,
+                        help='Muon Newton-Schulz iteration steps')
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--lradj', type=str, default='type3', help='adjust learning rate')
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct start')
@@ -82,15 +88,30 @@ def main():
     Exp = Exp_Main
 
     # Setting record of experiments
-    setting = '{}_{}_{}_{}_sl{}_pl{}_lr{}_{}'.format(
-        args.model_id,
-        args.model,
-        args.fusion_version,
-        args.data,
-        args.seq_len,
-        args.pred_len,
-        args.learning_rate,
-        args.des)
+    fusion_loss = args.fusion_loss or 'default'
+    fusion_aux = (
+        args.fusion_aux_loss_weight
+        if args.fusion_aux_loss_weight is not None
+        else 'default'
+    )
+    fusion_dropout = (
+        args.fusion_dropout
+        if args.fusion_dropout is not None
+        else 'default'
+    )
+    fusion_d_model = (
+        args.fusion_d_model
+        if args.fusion_d_model is not None
+        else 'default'
+    )
+    setting = (
+        f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
+        f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
+        f'_opt{args.optimizer}_lr{args.learning_rate}_wd{args.weight_decay}'
+        f'_mom{args.muon_momentum}_ns{args.muon_ns_steps}'
+        f'_loss{fusion_loss}_aux{fusion_aux}_drop{fusion_dropout}'
+        f'_df{fusion_d_model}_expert{args.fusion_expert_name}_{args.des}'
+    )
 
     train_df = pd.read_parquet('xxx')
     valid_df = pd.read_parquet('xxx')

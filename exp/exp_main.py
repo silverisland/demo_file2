@@ -2,6 +2,7 @@ from data_provider.fusion_dataset import data_provider
 from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric
+from utils.optimizers import Muon
 
 from models.factory import build_fusion_model
     
@@ -74,12 +75,33 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()), 
-            lr=self.args.learning_rate,
-            weight_decay=self.args.weight_decay,
-        )
-        return model_optim
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer_name = self.args.optimizer.lower()
+        optimizer_kwargs = {
+            "lr": self.args.learning_rate,
+            "weight_decay": self.args.weight_decay,
+        }
+
+        if optimizer_name == "adam":
+            return optim.Adam(trainable_params, **optimizer_kwargs)
+        if optimizer_name == "adamw":
+            return optim.AdamW(trainable_params, **optimizer_kwargs)
+        if optimizer_name in {"muon", "moun"}:
+            muon_params = [p for p in trainable_params if p.ndim >= 2]
+            adamw_params = [p for p in trainable_params if p.ndim < 2]
+            param_groups = []
+            if muon_params:
+                param_groups.append({"params": muon_params, "use_muon": True})
+            if adamw_params:
+                param_groups.append({"params": adamw_params, "use_muon": False})
+            return Muon(
+                param_groups,
+                momentum=self.args.muon_momentum,
+                ns_steps=self.args.muon_ns_steps,
+                **optimizer_kwargs,
+            )
+
+        raise ValueError(f"Unknown optimizer={self.args.optimizer!r}.")
 
     def vali(self, vali_data, vali_loader):
         total_loss = []

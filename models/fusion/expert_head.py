@@ -280,7 +280,7 @@ class ExpertHeadReconstruction(nn.Module):
         if flag == "test":
             if return_info:
                 return output, {"expert_name": self.expert_name, "hidden": hidden}
-            return output
+            return output.squeeze(1)
 
         if flag != "train":
             raise ValueError("flag must be either 'train' or 'test'.")
@@ -452,7 +452,7 @@ class MultiExpertHeadFusion(nn.Module):
         if flag == "test":
             if return_info:
                 return output, info
-            return output
+            return output.squeeze(1)
 
         if flag != "train":
             raise ValueError("flag must be either 'train' or 'test'.")

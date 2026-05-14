@@ -19,17 +19,21 @@ def main():
     parser.add_argument('--model', type=str, required=True, default='FusionModel',
                         help='model name, options: [FusionModel, DLinear, PatchTST, iTransformer, TimesNet]')
     parser.add_argument('--fusion_version', type=str, default='base',
-                        choices=['base', 'expert_head', 'multi_expert_head', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
+                        choices=['base', 'expert_head', 'multi_expert_head', 'expert_head_v2', 'legacy', 'v2', 'v3', 'v4', 'v5', 'tensor_v3'],
                         help='fusion model version selected by models/factory.py')
     parser.add_argument('--fusion_expert_name', type=str, default='m1',
                         choices=['m1', 'm2', 'm3', 'm4'],
                         help='single expert used by expert_head reconstruction')
+    parser.add_argument('--fusion_expert_names', type=str, default=None,
+                        help="comma-separated experts for multi-expert fusion, e.g. 'm1,m2,m4'")
     parser.add_argument('--fusion_d_model', type=int, default=None,
                         help='fusion hidden dimension override')
     parser.add_argument('--fusion_dropout', type=float, default=None,
                         help='fusion dropout override')
     parser.add_argument('--fusion_expert_dims', type=str, default=None,
                         help="expert hidden dims, e.g. 'm1:512,m2:256,m3:384,m4:512'")
+    parser.add_argument('--fusion_aligned_tokens', type=str, default=None,
+                        help="aligned token counts, e.g. 'm1:9,m2:2,m4:9'")
     parser.add_argument('--fusion_loss', type=str, default=None,
                         choices=['mse', 'mae', 'huber'],
                         help='loss type for fusion versions that support it')
@@ -104,13 +108,16 @@ def main():
         if args.fusion_d_model is not None
         else 'default'
     )
+    fusion_expert_names = args.fusion_expert_names or args.fusion_expert_name
+    fusion_aligned_tokens = args.fusion_aligned_tokens or 'default'
     setting = (
         f'{args.model_id}_{args.model}_{args.fusion_version}_{args.data}'
         f'_sl{args.seq_len}_pl{args.pred_len}_bs{args.batch_size}'
         f'_opt{args.optimizer}_lr{args.learning_rate}_wd{args.weight_decay}'
         f'_mom{args.muon_momentum}_ns{args.muon_ns_steps}'
         f'_loss{fusion_loss}_aux{fusion_aux}_drop{fusion_dropout}'
-        f'_df{fusion_d_model}_expert{args.fusion_expert_name}_{args.des}'
+        f'_df{fusion_d_model}_tok{fusion_aligned_tokens}'
+        f'_expert{fusion_expert_names}_{args.des}'
     )
 
     train_df = pd.read_parquet('xxx')

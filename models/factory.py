@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from .fusion.base import FusionBase
 from .fusion.expert_head import ExpertHeadReconstruction, MultiExpertHeadFusion
+from .fusion.expert_head_v2 import AlignedExpertHeadFusion
 from .fusion.legacy import FusionModel as FusionLegacy
 from .fusion.tensor_v3 import FusionModelV3 as FusionTensorV3
 from .fusion.v2 import FusionModel as FusionV2
@@ -17,6 +18,7 @@ FUSION_REGISTRY = {
     "base": FusionBase,
     "expert_head": ExpertHeadReconstruction,
     "multi_expert_head": MultiExpertHeadFusion,
+    "expert_head_v2": AlignedExpertHeadFusion,
     "legacy": FusionLegacy,
     "v2": FusionV2,
     "v3": FusionModelV3,
@@ -30,6 +32,7 @@ HIDDEN_ONLY_FUSION_VERSIONS = {
     "base",
     "expert_head",
     "multi_expert_head",
+    "expert_head_v2",
     "v4",
     "v5",
     "tensor_v3",
@@ -92,6 +95,12 @@ def parse_expert_dims(raw_value):
     return dims
 
 
+def parse_expert_names(raw_value):
+    if raw_value is None or raw_value == "":
+        return None
+    return [name.strip() for name in raw_value.split(",") if name.strip()]
+
+
 def _filter_constructor_kwargs(model_cls, kwargs):
     signature = inspect.signature(model_cls.__init__)
     parameters = signature.parameters
@@ -116,6 +125,8 @@ def build_fusion_model(args, base_models=None, device=None):
     model_cls = get_fusion_model_class(version)
 
     expert_dims = parse_expert_dims(getattr(args, "fusion_expert_dims", None))
+    aligned_tokens = parse_expert_dims(getattr(args, "fusion_aligned_tokens", None))
+    expert_names = parse_expert_names(getattr(args, "fusion_expert_names", None))
     d_fusion = getattr(args, "fusion_d_model", None)
     dropout = getattr(args, "fusion_dropout", None)
     target_key = getattr(args, "target_key", None)
@@ -129,6 +140,8 @@ def build_fusion_model(args, base_models=None, device=None):
         "pred_len": args.pred_len,
         "n_features": args.enc_in,
         "expert_dims": expert_dims,
+        "expert_names": expert_names,
+        "aligned_tokens": aligned_tokens,
         "d_fusion": d_fusion,
         "dropout": dropout,
         "target_key": target_key,
